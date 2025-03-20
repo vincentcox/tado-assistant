@@ -41,11 +41,12 @@ handle_curl_error() {
 }
 
 # Login function
+# Function to refresh tokens properly
 login() {
     local account_index=$1
     local refresh_token_var="TADO_REFRESH_TOKEN_$account_index"
     local refresh_token="${!refresh_token_var}"
-    local token_response expires_in new_refresh_token home_data home_id
+    local token_response access_token expires_in new_refresh_token home_data home_id
     local retry_count=0
 
     while [ $retry_count -lt 3 ]; do
@@ -54,20 +55,22 @@ login() {
             -d "grant_type=refresh_token" \
             -d "refresh_token=$refresh_token")
 
-        if ! handle_curl_error; then
+        if [ $? -ne 0 ]; then
             log_message "❌ Curl error during token refresh for account $account_index. Retrying later."
             return 1
         fi
 
-        local access_token=$(echo "$token_response" | jq -r '.access_token')
+        access_token=$(echo "$token_response" | jq -r '.access_token')
         new_refresh_token=$(echo "$token_response" | jq -r '.refresh_token')
 
-        # Retain existing refresh token if none provided
-        if [[ -z "$new_refresh_token" || "$new_refresh_token" == "null" ]]; then
-            new_refresh_token="$refresh_token"
-        fi
-
         if [ -n "$access_token" ] && [ "$access_token" != "null" ]; then
+            # Store the new refresh token immediately
+            if [ -n "$new_refresh_token" ] && [ "$new_refresh_token" != "null" ]; then
+                escaped_new_refresh_token=$(printf "%s" "$new_refresh_token" | sed "s/'/'\\\\''/g")
+                sed -i'' "s/^export TADO_REFRESH_TOKEN_${account_index}='.*'/export TADO_REFRESH_TOKEN_${account_index}='${escaped_new_refresh_token}'/" /etc/tado-assistant.env
+                source /etc/tado-assistant.env # Reload env variables
+                log_message "🔄 Updated refresh token for account $account_index."
+            fi
             break
         fi
 
@@ -81,31 +84,25 @@ login() {
         exit 1
     fi
 
-    # Update environment file only if token changed
-    if [ "$new_refresh_token" != "$refresh_token" ]; then
-        escaped_new_refresh_token=$(printf "%s" "$new_refresh_token" | sed "s/'/'\\\\''/g")
-        sed -i'' "s/^export TADO_REFRESH_TOKEN_${account_index}='.*'/export TADO_REFRESH_TOKEN_${account_index}='${escaped_new_refresh_token}'/" /etc/tado-assistant.env
-    fi
-
-    # Update in-memory environment variable
-    declare "TADO_REFRESH_TOKEN_${account_index}=$new_refresh_token"
-    export "TADO_REFRESH_TOKEN_${account_index}"
-
+    # Save the access token in memory
     TOKENS[$account_index]=$access_token
     expires_in=$(echo "$token_response" | jq -r '.expires_in')
     EXPIRY_TIMES[$account_index]=$(($(date +%s) + expires_in - 60))
 
-    home_data=$(curl -s -X GET "https://my.tado.com/api/v2/me" -H "Authorization: Bearer ${TOKENS[$account_index]}")
-    handle_curl_error
+    log_message "✅ Successfully refreshed token for account $account_index."
 
+    # Fetch home ID
+    home_data=$(curl -s -X GET "https://my.tado.com/api/v2/me" -H "Authorization: Bearer ${TOKENS[$account_index]}")
     home_id=$(echo "$home_data" | jq -r '.homes[0].id')
-    if [ -z "$home_id" ]; then
+
+    if [ -z "$home_id" ] || [ "$home_id" == "null" ]; then
         log_message "⚠️ Error fetching home ID for account $account_index!"
         exit 1
     fi
 
     HOME_IDS[$account_index]=$home_id
 }
+
 
 log_message() {
     local message="$1"
